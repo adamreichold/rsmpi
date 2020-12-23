@@ -12,7 +12,7 @@
 //! `MPI_Rsend_init()`, `MPI_Recv_init()`, `MPI_Start()`, `MPI_Startall()`
 
 use std::alloc::{self, Layout};
-use std::mem::{transmute, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::{fmt, ptr};
 
 use conv::ConvUtil;
@@ -146,9 +146,9 @@ pub unsafe trait Source: AsCommunicator {
     /// 3.2.4
     fn receive_with_tag<Msg>(&self, tag: Tag) -> (Msg, Status)
     where
-        Msg: Equivalence + EquivalenceFromAnyBytes,
+        Msg: SafeToReceive,
     {
-        let datatype = Msg::equivalent_datatype();
+        let datatype = Msg::Inner::equivalent_datatype();
         unsafe {
             let mut msg = MaybeUninit::uninit();
             let (_, status) = with_uninitialized(|status| {
@@ -192,7 +192,7 @@ pub unsafe trait Source: AsCommunicator {
     /// 3.2.4
     fn receive<Msg>(&self) -> (Msg, Status)
     where
-        Msg: Equivalence + EquivalenceFromAnyBytes,
+        Msg: SafeToReceive,
     {
         self.receive_with_tag(unsafe { ffi::RSMPI_ANY_TAG })
     }
@@ -250,7 +250,7 @@ pub unsafe trait Source: AsCommunicator {
     /// 3.2.4
     fn receive_vec_with_tag<Msg>(&self, tag: Tag) -> (Vec<Msg>, Status)
     where
-        Msg: Equivalence + EquivalenceFromAnyBytes,
+        Msg: SafeToReceive,
     {
         self.matched_probe_with_tag(tag).matched_receive_vec()
     }
@@ -268,7 +268,7 @@ pub unsafe trait Source: AsCommunicator {
     /// 3.2.4
     fn receive_vec<Msg>(&self) -> (Vec<Msg>, Status)
     where
-        Msg: Equivalence + EquivalenceFromAnyBytes,
+        Msg: SafeToReceive,
     {
         self.receive_vec_with_tag(unsafe { ffi::RSMPI_ANY_TAG })
     }
@@ -338,7 +338,7 @@ pub unsafe trait Source: AsCommunicator {
     /// 3.7.2
     fn immediate_receive_with_tag<Msg>(&self, tag: Tag) -> ReceiveFuture<Msg>
     where
-        Msg: Equivalence + EquivalenceFromAnyBytes,
+        Msg: SafeToReceive,
     {
         unsafe {
             let val = alloc::alloc(Layout::new::<Msg>()) as *mut Msg;
@@ -346,7 +346,7 @@ pub unsafe trait Source: AsCommunicator {
                 ffi::MPI_Irecv(
                     val as _,
                     1,
-                    Msg::equivalent_datatype().as_raw(),
+                    Msg::Inner::equivalent_datatype().as_raw(),
                     self.source_rank(),
                     tag,
                     self.as_communicator().as_raw(),
@@ -370,7 +370,7 @@ pub unsafe trait Source: AsCommunicator {
     /// 3.7.2
     fn immediate_receive<Msg>(&self) -> ReceiveFuture<Msg>
     where
-        Msg: Equivalence + EquivalenceFromAnyBytes,
+        Msg: SafeToReceive,
     {
         self.immediate_receive_with_tag(unsafe { ffi::RSMPI_ANY_TAG })
     }
@@ -969,9 +969,9 @@ impl Message {
     /// 3.8.3
     pub fn matched_receive<Msg>(mut self) -> (Msg, Status)
     where
-        Msg: Equivalence + EquivalenceFromAnyBytes,
+        Msg: SafeToReceive,
     {
-        let datatype = Msg::equivalent_datatype();
+        let datatype = Msg::Inner::equivalent_datatype();
 
         let mut res = MaybeUninit::uninit();
         unsafe {
@@ -1086,32 +1086,46 @@ pub trait MatchedReceiveVec {
     /// Receives the message `&self` which contains multiple instances of type `Msg` into a `Vec`.
     fn matched_receive_vec<Msg>(self) -> (Vec<Msg>, Status)
     where
-        Msg: Equivalence + EquivalenceFromAnyBytes;
+        Msg: SafeToReceive;
 }
 
 impl MatchedReceiveVec for (Message, Status) {
     fn matched_receive_vec<Msg>(self) -> (Vec<Msg>, Status)
     where
-        Msg: Equivalence + EquivalenceFromAnyBytes,
+        Msg: SafeToReceive,
     {
-        let (message, status) = self;
+        let datatype = Msg::Inner::equivalent_datatype();
+        let raw_datatype = datatype.as_raw();
+
+        let (mut message, status) = self;
         let count = status
-            .count(Msg::equivalent_datatype())
+            .count(datatype)
             .expect(
                 "Received buffer was not valid for the datatype's `Equivalence` implementation.",
             )
             .value_as()
             .expect("Message element count cannot be expressed as a usize.");
 
-        let mut res = (0..count)
-            .map(|_| MaybeUninit::uninit())
-            .collect::<Vec<MaybeUninit<Msg>>>();
+        let mut res = Vec::with_capacity(count);
 
-        let status = message.matched_receive_into(&mut res[..]);
+        let status;
+        unsafe {
+            status = with_uninitialized(|status| {
+                ffi::MPI_Mrecv(
+                    res.as_mut_ptr() as _,
+                    count as _,
+                    raw_datatype,
+                    message.as_raw_mut(),
+                    status,
+                )
+            })
+            .1;
+            assert_eq!(message.as_raw(), ffi::RSMPI_MESSAGE_NULL);
 
-        let res = unsafe { transmute(res) };
+            res.set_len(count);
+        };
 
-        (res, status)
+        (res, Status(status))
     }
 }
 
@@ -1131,7 +1145,7 @@ pub fn send_receive_with_tags<M, D, R, S>(
 where
     M: Equivalence,
     D: Destination,
-    R: Equivalence + EquivalenceFromAnyBytes,
+    R: SafeToReceive,
     S: Source,
 {
     assert_eq!(
@@ -1142,7 +1156,7 @@ where
     );
 
     let mut res = MaybeUninit::uninit();
-    let receive_datatype = R::equivalent_datatype();
+    let receive_datatype = R::Inner::equivalent_datatype();
     unsafe {
         let (_, status) = with_uninitialized(|status| {
             ffi::MPI_Sendrecv(
@@ -1182,7 +1196,7 @@ pub fn send_receive<R, M, D, S>(msg: &M, destination: &D, source: &S) -> (R, Sta
 where
     M: Equivalence,
     D: Destination,
-    R: Equivalence + EquivalenceFromAnyBytes,
+    R: SafeToReceive,
     S: Source,
 {
     send_receive_with_tags(msg, destination, Tag::default(), source, unsafe {
@@ -1340,12 +1354,12 @@ pub struct ReceiveFuture<T> {
 
 impl<T> ReceiveFuture<T>
 where
-    T: Equivalence + EquivalenceFromAnyBytes,
+    T: SafeToReceive,
 {
     /// Wait for the receive operation to finish and return the received data.
     pub fn get(self) -> (T, Status) {
         let status = self.req.wait();
-        let count = status.count(T::equivalent_datatype()).expect(
+        let count = status.count(T::Inner::equivalent_datatype()).expect(
             "Received buffer was not valid for the datatype's `Equivalence` implementation.",
         );
         assert_ne!(count, 0, "Received an empty message into a ReceiveFuture.");
@@ -1359,7 +1373,7 @@ where
     pub fn r#try(mut self) -> Result<(T, Status), Self> {
         match self.req.test() {
             Ok(status) => {
-                let count = status.count(T::equivalent_datatype()).expect(
+                let count = status.count(T::Inner::equivalent_datatype()).expect(
                     "Received buffer was not valid for the datatype's `Equivalence` implementation.",
                 );
                 assert_ne!(count, 0, "Received an empty message into a ReceiveFuture.");

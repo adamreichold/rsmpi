@@ -88,7 +88,7 @@ use crate::{
 pub mod traits {
     pub use super::{
         AsDatatype, Buffer, BufferMut, Collection, Datatype, Equivalence, EquivalenceFromAnyBytes,
-        Partitioned, PartitionedBuffer, PartitionedBufferMut, Pointer, PointerMut,
+        Partitioned, PartitionedBuffer, PartitionedBufferMut, Pointer, PointerMut, SafeToReceive,
         UncommittedDatatype,
     };
 }
@@ -193,8 +193,6 @@ pub unsafe trait Equivalence {
 /// `bool` is an example of a type that does not implement `EquivalenceFromAnyBytes`.
 pub unsafe trait EquivalenceFromAnyBytes {}
 
-unsafe impl<T> EquivalenceFromAnyBytes for MaybeUninit<T> where T: Equivalence {}
-
 macro_rules! equivalent_system_datatype_unsafe_transmute {
     ($rstype:path, $mpitype:path) => {
         unsafe impl Equivalence for $rstype {
@@ -269,16 +267,24 @@ mod ptr64_equivalences {
     equivalent_system_datatype!(Option<num::NonZeroUsize>, ffi::RSMPI_UINT64_T);
 }
 
-/// Allow datatypes with Equivalence to be used in buffer packing functions
-unsafe impl<T> Equivalence for MaybeUninit<T>
+/// TODO: document
+pub unsafe trait SafeToReceive {
+    /// TODO: document
+    type Inner: Equivalence;
+}
+
+unsafe impl<T> SafeToReceive for T
+where
+    T: Equivalence + EquivalenceFromAnyBytes,
+{
+    type Inner = T;
+}
+
+unsafe impl<T> SafeToReceive for MaybeUninit<T>
 where
     T: Equivalence,
 {
-    type Out = T::Out;
-
-    fn equivalent_datatype() -> Self::Out {
-        T::equivalent_datatype()
-    }
+    type Inner = T;
 }
 
 /// A user defined MPI datatype
